@@ -18,7 +18,7 @@ import binascii
 import hashlib
 import re
 from collections import OrderedDict
-
+from uuid import uuid4
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
@@ -33,10 +33,12 @@ from django.utils import timezone
 from django.utils.encoding import force_bytes
 from django.utils.encoding import force_str
 from django.utils.translation import ugettext_lazy as _
-
+from datetime import timedelta
 from .managers import CertificateAuthorityManager
+from .managers import RequestManager
 from .managers import CertificateManager
 from .querysets import CertificateAuthorityQuerySet
+from .querysets import SigningRequestQuerySet
 from .querysets import CertificateQuerySet
 from .utils import EXTENDED_KEY_USAGE_REVERSED
 from .utils import KEY_USAGE_MAPPING
@@ -83,9 +85,16 @@ class X509CertMixin(models.Model):
 
     pub = models.TextField(verbose_name=_('Public key'))
     cn = models.CharField(max_length=128, verbose_name=_('CommonName'))
-    serial = models.CharField(max_length=64, unique=True)
+    serial = models.CharField(max_length=64, null=True, unique=True)
 
     _x509 = None
+
+    @property
+    def ax509(self):
+        if self._x509 is None:
+            backend = default_backend()
+            self._x509 = x509.load_pem_x509_csr(force_bytes(self.pub), backend)
+        return self._x509
 
     @property
     def x509(self):
@@ -97,10 +106,17 @@ class X509CertMixin(models.Model):
     @x509.setter
     def x509(self, value):
         self._x509 = value
-        self.pub = force_str(self.dump_certificate(Encoding.PEM))
-        self.cn = self.subject['CN']
-        self.expires = self.not_after
-        self.serial = int_to_hex(value.serial_number)
+        if isinstance(self._x509, x509.CertificateSigningRequest):
+            self.pub = force_str(self._x509.public_bytes(Encoding.PEM))
+            # FIXME real serial and expiration
+            self.serial = str(uuid4())
+            self.expires = timezone.now() + timedelta(days=30)
+            self.cn = self.subject['CN']
+        else:
+            self.pub = force_str(self.dump_certificate(Encoding.PEM))
+            self.cn = self.subject['CN']
+            self.serial = int_to_hex(value.serial_number)
+            self.expires = self.not_after
 
     @property
     def subject(self):
@@ -292,6 +308,9 @@ class X509CertMixin(models.Model):
     def dump_certificate(self, encoding=Encoding.PEM):
         return self.x509.public_bytes(encoding=encoding)
 
+    def dump_csr(self, encoding=Encoding.PEM):
+        return self.x509.public_bytes(encoding=encoding)
+
     class Meta:
         abstract = True
 
@@ -359,6 +378,47 @@ class CertificateAuthority(X509CertMixin):
 
     def __str__(self):
         return self.name
+
+
+class CoreSettings(models.Model):
+    frontend = models.BooleanField(default=True)
+    backend = models.BooleanField(default=True)
+    csr_key_path = models.CharField(max_length=256, help_text=_('Path to the private key.'))
+    csr_public_key = models.TextField(verbose_name=_('CSR Public Key'))
+
+
+class SigningRequest(X509CertMixin):
+    objects = RequestManager.from_queryset(SigningRequestQuerySet)()
+    created = models.DateTimeField(auto_now=True)
+    # The requested CA that the user is requesting a signature of
+    requested_ca = models.ForeignKey(CertificateAuthority, models.CASCADE,
+                                     related_name='requested_ca',
+                                     verbose_name=_('Preferred Certificate Authority'))
+    requested_public_key = models.TextField(verbose_name=_('Comment'))
+    # The CSR that the user submitted(before changes)
+    requested_csr = models.TextField(verbose_name=_('CSR'))
+    request_comment = models.TextField(verbose_name=_('Comment/Primary Use'))
+    # CA that the request is actually being routed to
+    routed_ca = models.ForeignKey(CertificateAuthority, models.CASCADE,
+                                  related_name='routed_ca', null=True,
+                                  verbose_name=_('Assigned Certificate Authority'))
+    # The CSR that the frontend created and resigned
+    resigned_csr = models.TextField(verbose_name=_('Resigned CSR'))
+    cn = models.CharField(max_length=128, verbose_name=_('CommonName'))
+
+    verdict = models.NullBooleanField(verbose_name=_('Approve Signing Request'))
+    verdict_comment = models.TextField(verbose_name=_('Comment'))
+    verdict_date = models.DateTimeField(auto_now=True)
+
+    # approver = models.ForeignKey(settings.AUTH_USER_MODEL)
+    # requester = models.ForeignKey(settings.AUTH_USER_MODEL)
+
+    @property
+    def subject(self):
+        return OrderedDict([(OID_NAME_MAPPINGS[s.oid], s.value) for s in self.x509.subject])
+
+    def __str__(self):
+        return self.cn
 
 
 class Certificate(X509CertMixin):

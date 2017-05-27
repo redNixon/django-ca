@@ -14,7 +14,7 @@
 # see <http://www.gnu.org/licenses/>.
 
 import os
-
+import pdb
 import idna
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
@@ -34,6 +34,8 @@ from . import ca_settings
 from .utils import EXTENDED_KEY_USAGE_MAPPING
 from .utils import KEY_USAGE_MAPPING
 from .utils import get_cert_builder
+from .utils import get_csr_builder
+from .utils import OID_NAME_MAPPINGS
 from .utils import is_power2
 from .utils import parse_general_name
 from .utils import x509_name
@@ -61,6 +63,138 @@ class CertificateManagerMixin(object):
         if auth_info_access:
             extensions.append((False, x509.AuthorityInformationAccess(auth_info_access)))
         return extensions
+
+
+class RequestManager(models.Manager):
+
+    def init(self, ca, csr, *args, **kwargs):
+        self.csr = csr.public_bytes(Encoding.PEM).decode('utf-8')
+
+    def create_csr(self, ca, csr, expires, algorithm, subject=None, cn_in_san=True, csr_format=Encoding.PEM,
+                   subjectAltName=None, keyUsage=None, extendedKeyUsage=None, password=None):
+        """Create a signed certificate from a CSR.
+
+        X509 extensions (`key_usage`, `ext_key_usage`) may either be None (in which case they are
+        not added) or a tuple with the first value being a bool indicating if the value is critical
+        and the second value being a byte-array indicating the extension value. Example::
+
+            (True, b'value')
+
+        Parameters
+        ----------
+
+        ca : :py:class:`~django_ca.models.CertificateAuthority`
+            The certificate authority to sign the certificate with.
+        csr : str
+            A valid CSR. The format is given by the ``csr_format`` parameter.
+        expires : int
+            When the certificate should expire (passed to :py:func:`get_cert_builder`).
+        algorithm : {'sha512', 'sha256', ...}
+            Algorithm used to sign the certificate. The default is the CA_DIGEST_ALGORITHM setting.
+        subject : dict, optional
+            The Subject to use in the certificate.  The keys of this dict are the fields of an X509
+            subject, that is `"C"`, `"ST"`, `"L"`, `"OU"` and `"CN"`. If ommited or if the value
+            does not contain a `"CN"` key, the first value of the `subjectAltName` parameter is
+            used as CommonName (and is obviously mandatory in this case).
+        cn_in_san : bool, optional
+            Wether the CommonName should also be included as subjectAlternativeName. The default is
+            `True`, but the parameter is ignored if no CommonName is given. This is typically set
+            to `False` when creating a client certificate, where the subjects CommonName has no
+            meaningful value as subjectAltName.
+        csr_format : :py:class:`~cryptography:cryptography.hazmat.primitives.serialization.Encoding`, optional
+            The format of the CSR. The default is ``PEM``.
+        subjectAltName : list of str, optional
+            A list of values for the subjectAltName extension. Values are passed to
+            :py:func:`~django_ca.utils.parse_general_name`, see function documentation for how this value is
+            parsed.
+        keyUsage : tuple or None
+            Value for the `keyUsage` X509 extension. See description for format details.
+        extendedKeyUsage : tuple or None
+            Value for the `extendedKeyUsage` X509 extension. See description for format details.
+        password : bytes, optional
+            Password used to load the private key of the certificate authority. If not passed, the private key
+            is assumed to be unencrypted.
+
+        Returns
+        -------
+
+        cryptography.x509.Certificate
+            The signed certificate.
+        """
+        if subject is None:
+            subject = {}
+        if not subject.get('CN') and not subjectAltName:
+            raise ValueError("Must name at least a CN or a subjectAltName.")
+
+        if subjectAltName:
+            subjectAltName = [parse_general_name(san) for san in subjectAltName]
+        else:
+            subjectAltName = []  # so we can append the CN if requested
+
+        if not subject.get('CN'):  # use first SAN as CN if CN is not set
+            subject['CN'] = subjectAltName[0].value
+        elif cn_in_san and subject.get('CN'):  # add CN to SAN if cn_in_san is True (default)
+            try:
+                cn_name = parse_general_name(subject['CN'])
+            except idna.IDNAError:
+                raise ValueError('%s: Could not parse CommonName as subjectAltName.' % subject['CN'])
+            else:
+                if cn_name not in subjectAltName:
+                    subjectAltName.insert(0, cn_name)
+
+        if csr_format == Encoding.PEM:
+            req = x509.load_pem_x509_csr(force_bytes(csr), default_backend())
+        elif csr_format == Encoding.DER:
+            req = x509.load_der_x509_csr(force_bytes(csr), default_backend())
+        else:
+            raise ValueError('Unknown CSR format passed: %s' % csr_format)
+        # csr_subject = [(OID_NAME_MAPPINGS[s.oid], s.value) for s in req.subject]
+        """
+        >> from cryptography import x509
+        >> from cryptography.hazmat.backends import default_backend
+        >> from cryptography.hazmat.primitives import hashes
+        >> from cryptography.hazmat.primitives.asymmetric import rsa
+        >> from cryptography.x509.oid import NameOID
+        .. )
+        >> builder = x509.CertificateSigningRequestBuilder()
+        >> builder = builder.subject_name(x509.Name([
+        ..     x509.NameAttribute(NameOID.COMMON_NAME, u'cryptography.io'),
+        .. ]))
+        >> builder = builder.add_extension(
+        ..     x509.BasicConstraints(ca=False, path_length=None), critical=True,
+        .. )
+        >> request = builder.sign(
+        ..     private_key, hashes.SHA256(), default_backend()
+        .. )
+        >> isinstance(request, x509.CertificateSigningRequest)
+        True
+        """
+        # csr_key = req.getkey()
+        import pdb; pdb.set_trace() # noqa
+        builder, csr_key = get_csr_builder()
+        builder = builder.subject_name(x509_name(subject))
+
+        # Add extensions
+        builder = builder.add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+
+        if subjectAltName:
+            builder = builder.add_extension(x509.SubjectAlternativeName(subjectAltName), critical=False)
+
+        if keyUsage:
+            critical, values = keyUsage
+            params = {v: False for v in KEY_USAGE_MAPPING.values()}
+            for value in [KEY_USAGE_MAPPING[k] for k in values.split(',')]:
+                params[value] = True
+            builder = builder.add_extension(x509.KeyUsage(**params), critical=critical)
+
+        if extendedKeyUsage:
+            critical, usages = extendedKeyUsage
+            usages = [EXTENDED_KEY_USAGE_MAPPING[u] for u in usages.split(',')]
+            builder = builder.add_extension(x509.ExtendedKeyUsage(usages), critical=critical)
+
+        req = builder.sign(csr_key,
+                           algorithm=algorithm, backend=default_backend())
+        return req
 
 
 class CertificateAuthorityManager(CertificateManagerMixin, models.Manager):
@@ -305,8 +439,10 @@ class CertificateManager(CertificateManagerMixin, models.Manager):
         if ca.issuer_alt_name:
             builder = builder.add_extension(x509.IssuerAlternativeName(
                 [parse_general_name(ca.issuer_alt_name)]), critical=False)
+        # return builder.sign(private_key=ca.key(password),
+        #           algorithm=algorithm, backend=default_backend()), req
 
-        return builder.sign(private_key=ca.key(password), algorithm=algorithm, backend=default_backend()), req
+        return builder, req
 
     def init(self, ca, csr, *args, **kwargs):
         c = self.model(ca=ca)

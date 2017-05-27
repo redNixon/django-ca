@@ -27,6 +27,8 @@ import idna
 from cryptography import x509
 from cryptography.x509.oid import ExtendedKeyUsageOID
 from cryptography.x509.oid import NameOID
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from django.core.serializers.json import DjangoJSONEncoder
 from django.core.validators import URLValidator
@@ -425,6 +427,16 @@ def parse_general_name(name):
             idna.encode(name)
 
         return x509.DNSName(name)
+
+
+def get_csr_builder(now=None):
+    csr_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend()
+    )
+    builder = x509.CertificateSigningRequestBuilder()
+    return builder, csr_key
 
 
 def get_cert_builder(expires, now=None):

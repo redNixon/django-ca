@@ -31,6 +31,20 @@ class CertificateAuthorityQuerySet(models.QuerySet, SerialMixin):
         return self.filter(enabled=True)
 
 
+class SigningRequestQuerySet(models.QuerySet, SerialMixin):
+    def pending(self):
+        return self.filter(verdict=None)
+
+    def approved(self):
+        return self.filter(verdict=True)
+
+    def rejected(self):
+        return self.filter(verdict=False)
+
+    def valid(self):
+        return True
+
+
 class CertificateQuerySet(models.QuerySet, SerialMixin):
     def valid(self):
         """Return valid certificates."""

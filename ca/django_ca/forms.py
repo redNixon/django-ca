@@ -30,6 +30,8 @@ from .fields import KeyUsageField
 from .fields import SubjectAltNameField
 from .fields import SubjectField
 from .models import Certificate
+from .models import SigningRequest
+from .models import CertificateAuthority
 from .utils import EXTENDED_KEY_USAGE_DESC
 from .utils import KEY_USAGE_DESC
 from .widgets import ProfileWidget
@@ -68,6 +70,264 @@ class X509CertMixinAdminForm(forms.ModelForm):
         self._meta.help_texts['pub'] = _(
             'Download: <a href="%s?format=PEM">as PEM</a> | <a href="%s?format=DER">as DER</a>.'
         ) % (url, url)
+
+
+class CreateCertificateAuthorityForm(forms.ModelForm):
+    def __init__(self, *args, **kwargs):
+        super(CreateCertificateAuthorityForm, self).__init__(*args, **kwargs)
+
+        # Set choices so we can filter out CAs where the private key does not exist locally
+        field = self.fields['parent']
+        field.choices = [
+            (field.prepare_value(ca), field.label_from_instance(ca))
+            for ca in self.fields['parent'].queryset.filter(enabled=True)
+            if os.path.exists(ca.private_key_path)
+        ]
+
+    password = forms.CharField(widget=forms.PasswordInput, required=False, help_text=_(
+        'Password for the private key. If not given, the private key must be unencrypted.'))
+    expires = forms.DateField(initial=_initial_expires, widget=AdminDateWidget())
+    subject = SubjectField(label="Subject", required=True)
+    subjectAltName = SubjectAltNameField(
+        label='subjectAltName', required=False,
+        help_text=_('''Coma-separated list of alternative names for the certificate.''')
+    )
+    profile = forms.ChoiceField(
+        required=False, widget=ProfileWidget,
+        help_text=_('Select a suitable profile or manually select X509 extensions below.'),
+        initial=ca_settings.CA_DEFAULT_PROFILE, choices=_profile_choices)
+    algorithm = forms.ChoiceField(
+        label=_('Signature algorithm'), initial=ca_settings.CA_DIGEST_ALGORITHM, choices=[
+            ('SHA512', 'SHA-512'),
+            ('SHA256', 'SHA-256'),
+            ('SHA1', 'SHA-1 (insecure!)'),
+            ('MD5', 'MD5 (insecure!)'),
+        ],
+        help_text=_(
+            'Algorithm used for signing the certificate. SHA-512 should be fine in most cases.'
+        ),
+    )
+    keyUsage = KeyUsageField(label='keyUsage', help_text=KEY_USAGE_DESC, choices=(
+        ('cRLSign', 'CRL Sign'),
+        ('dataEncipherment', 'dataEncipherment'),
+        ('decipherOnly', 'decipherOnly'),
+        ('digitalSignature', 'Digital Signature'),
+        ('encipherOnly', 'encipherOnly'),
+        ('keyAgreement', 'Key Agreement'),
+        ('keyCertSign', 'Certificate Sign'),
+        ('keyEncipherment', 'Key Encipherment'),
+        ('nonRepudiation', 'nonRepudiation'),
+    ))
+    extendedKeyUsage = KeyUsageField(
+        label='extendedKeyUsage', help_text=EXTENDED_KEY_USAGE_DESC, choices=(
+            ('serverAuth', 'SSL/TLS Web Server Authentication'),
+            ('clientAuth', 'SSL/TLS Web Client Authentication'),
+            ('codeSigning', 'Code signing'),
+            ('emailProtection', 'E-mail Protection (S/MIME)'),
+            ('timeStamping', 'Trusted Timestamping'),
+            ('OCSPSigning', 'OCSP Signing'),
+        ))
+
+    def clean_csr(self):
+        data = self.cleaned_data['csr']
+        lines = data.splitlines()
+        if lines[0] != '-----BEGIN CERTIFICATE REQUEST-----' \
+                or lines[-1] != '-----END CERTIFICATE REQUEST-----':
+            raise forms.ValidationError(_("Enter a valid CSR (in PEM format)."))
+
+        return data
+
+    def clean_algorithm(self):
+        algo = self.cleaned_data['algorithm']
+        try:
+            algo = getattr(hashes, algo.upper())()
+        except AttributeError:  # pragma: no cover
+            # We only add what is known to cryptography in `choices`, and other values posted are caught
+            # during Djangos standard form validation, so this should never happen.
+            raise forms.ValidationError(_('Unknown hash algorithm: %s') % algo)
+        return algo
+
+    def clean_keyUsage(self):
+        value, critical = self.cleaned_data['keyUsage']
+        if not value:
+            return None
+        value = ','.join(value)
+        return critical, value
+
+    def clean_extendedKeyUsage(self):
+        value, critical = self.cleaned_data['extendedKeyUsage']
+        if not value:
+            return None
+        value = ','.join(value)
+        return critical, value
+
+    def clean_expires(self):
+        expires = self.cleaned_data['expires']
+        if expires < date.today():
+            raise forms.ValidationError(_('Certificate cannot expire in the past.'))
+        return expires
+
+    def clean_password(self):
+        password = self.cleaned_data['password']
+        if not password:
+            return None
+        return password.encode('utf-8')
+
+    def clean(self):
+        data = super(CreateCertificateAuthorityForm, self).clean()
+        expires = data.get('expires')
+        ca = data.get('parent')
+        password = data.get('password')
+        # test the password
+        try:
+            ca.key(password)
+        except Exception as e:
+            self.add_error('password', str(e))
+
+        if ca and expires and ca.expires.date() < expires:
+            stamp = ca.expires.strftime('%Y-%m-%d')
+            self.add_error('expires', _(
+                'CA expires on %s, certificate must not expire after that.') % stamp)
+
+    class Meta:
+        model = CertificateAuthority
+        fields = ['parent', 'name', 'crl_url', 'issuer_url', 'ocsp_url', 'issuer_alt_name']
+        help_texts = {
+            'csr': _('''The Certificate Signing Request (CSR) in PEM format. To create a new one:
+<span class="shell">openssl genrsa -out hostname.key 4096
+openssl req -new -key hostname.key -out hostname.csr -utf8 -batch \\
+                     -subj '/CN=/hostname/emailAddress=root@hostname'
+</span>'''),
+        }
+
+
+class SigningRequestForm(forms.ModelForm):
+    def __init__(self, *args, **kwargs):
+        super(SigningRequestForm, self).__init__(*args, **kwargs)
+        # Set choices so we can filter out CAs where the private key does not exist locally
+        field = self.fields['requested_ca']
+        field.choices = [
+            (field.prepare_value(requested_ca), field.label_from_instance(requested_ca))
+            for requested_ca in self.fields['requested_ca'].queryset.filter(enabled=True)
+            if os.path.exists(requested_ca.private_key_path)
+        ]
+
+    password = forms.CharField(widget=forms.PasswordInput, required=False, help_text=_(
+        'Password for the private key. If not given, the private key must be unencrypted.'))
+    expires = forms.DateField(initial=_initial_expires, widget=AdminDateWidget())
+    subject = SubjectField(label="Subject", required=True)
+    subjectAltName = SubjectAltNameField(
+        label='subjectAltName', required=False,
+        help_text=_('''Coma-separated list of alternative names for the certificate.''')
+    )
+    profile = forms.ChoiceField(
+        required=False, widget=ProfileWidget,
+        help_text=_('Select a suitable profile or manually select X509 extensions below.'),
+        initial=ca_settings.CA_DEFAULT_PROFILE, choices=_profile_choices)
+    algorithm = forms.ChoiceField(
+        label=_('Signature algorithm'), initial=ca_settings.CA_DIGEST_ALGORITHM, choices=[
+            ('SHA512', 'SHA-512'),
+            ('SHA256', 'SHA-256'),
+            ('SHA1', 'SHA-1 (insecure!)'),
+            ('MD5', 'MD5 (insecure!)'),
+        ],
+        help_text=_(
+            'Algorithm used for signing the certificate. SHA-512 should be fine in most cases.'
+        ),
+    )
+    keyUsage = KeyUsageField(label='keyUsage', help_text=KEY_USAGE_DESC, choices=(
+        ('cRLSign', 'CRL Sign'),
+        ('dataEncipherment', 'dataEncipherment'),
+        ('decipherOnly', 'decipherOnly'),
+        ('digitalSignature', 'Digital Signature'),
+        ('encipherOnly', 'encipherOnly'),
+        ('keyAgreement', 'Key Agreement'),
+        ('keyCertSign', 'Certificate Sign'),
+        ('keyEncipherment', 'Key Encipherment'),
+        ('nonRepudiation', 'nonRepudiation'),
+    ))
+    extendedKeyUsage = KeyUsageField(
+        label='extendedKeyUsage', help_text=EXTENDED_KEY_USAGE_DESC, choices=(
+            ('serverAuth', 'SSL/TLS Web Server Authentication'),
+            ('clientAuth', 'SSL/TLS Web Client Authentication'),
+            ('codeSigning', 'Code signing'),
+            ('emailProtection', 'E-mail Protection (S/MIME)'),
+            ('timeStamping', 'Trusted Timestamping'),
+            ('OCSPSigning', 'OCSP Signing'),
+        ))
+
+    def clean_csr(self):
+        data = self.cleaned_data['requested_csr']
+        lines = data.splitlines()
+        if lines[0] != '-----BEGIN CERTIFICATE REQUEST-----' \
+                or lines[-1] != '-----END CERTIFICATE REQUEST-----':
+            raise forms.ValidationError(_("Enter a valid CSR (in PEM format)."))
+
+        return data
+
+    def clean_algorithm(self):
+        algo = self.cleaned_data['algorithm']
+        try:
+            algo = getattr(hashes, algo.upper())()
+        except AttributeError:  # pragma: no cover
+            # We only add what is known to cryptography in `choices`, and other values posted are caught
+            # during Djangos standard form validation, so this should never happen.
+            raise forms.ValidationError(_('Unknown hash algorithm: %s') % algo)
+        return algo
+
+    def clean_keyUsage(self):
+        value, critical = self.cleaned_data['keyUsage']
+        if not value:
+            return None
+        value = ','.join(value)
+        return critical, value
+
+    def clean_extendedKeyUsage(self):
+        value, critical = self.cleaned_data['extendedKeyUsage']
+        if not value:
+            return None
+        value = ','.join(value)
+        return critical, value
+
+    def clean_expires(self):
+        expires = self.cleaned_data['expires']
+        if expires < date.today():
+            raise forms.ValidationError(_('Certificate cannot expire in the past.'))
+        return expires
+
+    def clean_password(self):
+        password = self.cleaned_data['password']
+        if not password:
+            return None
+        return password.encode('utf-8')
+
+    def clean(self):
+        data = super(SigningRequestForm, self).clean()
+        expires = data.get('expires')
+        ca = data.get('requested_ca')
+        password = data.get('password')
+
+        # test the password
+        try:
+            ca.key(password)
+        except Exception as e:
+            self.add_error('password', str(e))
+
+        if ca and expires and ca.expires.date() < expires:
+            stamp = ca.expires.strftime('%Y-%m-%d')
+            self.add_error('expires', _(
+                'CA expires on %s, certificate must not expire after that.') % stamp)
+
+    class Meta:
+        model = SigningRequest
+        fields = ['requested_csr', 'requested_ca', ]
+        help_texts = {
+            'requested_csr': _('''The Certificate Signing Request (CSR) in PEM format. To create a new one:
+<span class="shell">openssl genrsa -out hostname.key 4096
+openssl req -new -key hostname.key -out hostname.csr -utf8 -batch \\
+                     -subj '/CN=/hostname/emailAddress=root@hostname'
+</span>'''),
+        }
 
 
 class CreateCertificateForm(forms.ModelForm):

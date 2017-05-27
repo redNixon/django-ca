@@ -32,9 +32,12 @@ from django.utils.html import mark_safe
 from django.utils.translation import ugettext_lazy as _
 
 from .forms import CreateCertificateForm
+from .forms import SigningRequestForm
+from .forms import CreateCertificateAuthorityForm
 from .forms import X509CertMixinAdminForm
 from .models import Certificate
 from .models import CertificateAuthority
+from .models import SigningRequest
 from .models import Watcher
 from .utils import OID_NAME_MAPPINGS
 from .views import RevokeCertificateView
@@ -112,7 +115,8 @@ on Wikipedia.</p>'''.replace('\n', ' ')
 class CertificateAuthorityAdmin(CertificateMixin, admin.ModelAdmin):
     fieldsets = (
         (None, {
-            'fields': ['name', 'enabled', 'cn', 'parent', 'hpkp_pin', ],
+            # 'fields': ['name', 'enabled', 'cn', 'parent', 'hpkp_pin', ],
+            'fields': ['name', 'csr', 'cn', 'parent', 'hpkp_pin', ],
         }),
         (_('Details'), {
             'description': _('Information to add to newly signed certificates.'),
@@ -139,16 +143,31 @@ class CertificateAuthorityAdmin(CertificateMixin, admin.ModelAdmin):
     readonly_fields = ['serial', 'pub', 'parent', 'subjectKeyIdentifier', 'issuerAltName',
                        'authorityKeyIdentifier', 'authorityInfoAccess', 'cn', 'expires',
                        'hpkp_pin', 'nameConstraints', ]
+    add_fieldsets = [
+        (None, {
+            'fields': ['csr', ('ca', 'password'), 'profile', 'subject', 'subjectAltName', 'algorithm',
+                       'expires', ],
+        }),
+        (_('X509 Extensions'), {
+            'fields': ['keyUsage', 'extendedKeyUsage', ]
+        }),
+    ]
 
     def has_add_permission(self, request):
-        return False
+        return True
+
+    def get_form(self, request, obj=None, **kwargs):
+        if obj is None:
+            return CreateCertificateAuthorityForm
+        else:
+            return super(CertificateAuthorityAdmin, self).get_form(request, obj=obj, **kwargs)
 
     class Media:
         css = {
             'all': (
                 'django_ca/admin/css/certificateauthorityadmin.css',
                 'django_ca/admin/css/monospace.css',
-            ),
+            )
         }
 
 
@@ -283,6 +302,7 @@ class CertificateAdmin(CertificateMixin, admin.ModelAdmin):
         return super(CertificateAdmin, self).get_readonly_fields(request, obj=obj)
 
     def status(self, obj):
+        return _('Valid')
         if obj.revoked:
             return _('Revoked')
         if obj.expires < timezone.now():
@@ -292,13 +312,15 @@ class CertificateAdmin(CertificateMixin, admin.ModelAdmin):
     status.short_description = _('Status')
 
     def expires_date(self, obj):
-        return obj.expires.date()
+        if obj.expires:
+            return obj.expires.date()
+        else:
+            return None
     expires_date.short_description = _('Expires')
     expires_date.admin_order_field = 'expires'
 
     def save_model(self, request, obj, form, change):
         data = form.cleaned_data
-
         # If this is a new certificate, initialize it.
         if change is False:  # # pragma: no branch
             san, cn_in_san = data['subjectAltName']
@@ -327,4 +349,155 @@ class CertificateAdmin(CertificateMixin, admin.ModelAdmin):
         }
         js = (
             'django_ca/admin/js/sign.js',
+        )
+
+
+@admin.register(SigningRequest)
+class SigningRequestAdmin(CertificateMixin, admin.ModelAdmin):
+    actions = ['revoke', ]
+    change_form_template = 'django_ca/admin/change_form.html'
+    list_display = ('cn', 'serial', 'status', 'expires_date')
+    list_filter = (StatusListFilter, 'requested_ca')
+    search_fields = ['cn', 'serial', ]
+
+    fieldsets = [
+        (None, {
+            'fields': ['cn', 'subjectAltName', 'distinguishedName', 'serial',
+                       'requested_ca', 'expires', 'hpkp_pin'],
+        }),
+        (_('X509 Extensions'), {
+            'fields': _x509_ext_fields,
+            'classes': ('collapse', ),
+        }),
+    ]
+    add_fieldsets = [
+        (None, {
+            'fields': ['requested_csr', ('requested_ca', 'password'), 'profile', 'subject',
+                       'subjectAltName', 'algorithm',
+                       'expires', ],
+        }),
+        (_('X509 Extensions'), {
+            'fields': ['keyUsage', 'extendedKeyUsage', ]
+        }),
+    ]
+
+    def has_add_permission(self, request):
+        # Only grant add permissions if there is at least one useable CA
+        for ca in CertificateAuthority.objects.filter(enabled=True):
+            if os.path.exists(ca.private_key_path):
+                return True
+        return False
+
+    def get_form(self, request, obj=None, **kwargs):
+        if obj is None:
+            return SigningRequestForm
+        else:
+            return super(SigningRequestAdmin, self).get_form(request, obj=obj, **kwargs)
+
+    def csr_details_view(self, request):
+        """Returns details of a CSR request."""
+
+        try:
+            csr = x509.load_pem_x509_csr(force_bytes(request.POST['csr']), default_backend())
+        except Exception as e:
+            return HttpResponseBadRequest(json.dumps({
+                'message': str(e),
+            }), content_type='application/json')
+
+        subject = {OID_NAME_MAPPINGS[s.oid]: s.value for s in csr.subject}
+        return HttpResponse(json.dumps({
+            'subject': subject,
+        }), content_type='application/json')
+
+    def get_urls(self):
+        # Remove the delete action from the URLs
+        urls = super(SigningRequestAdmin, self).get_urls()
+        meta = self.model._meta
+
+        # add revokation URL
+        revoke_name = '%s_%s_revoke' % (meta.app_label, meta.verbose_name)
+        revoke_view = self.admin_site.admin_view(
+            RevokeCertificateView.as_view(admin_site=self.admin_site))
+        urls.insert(0, url(r'^(?P<pk>.*)/revoke/$', revoke_view, name=revoke_name))
+
+        # add csr-details url
+        csr_name = '%s_%s_csr_details' % (meta.app_label, meta.verbose_name)
+        urls.insert(0, url(r'^ajax/csr-details', self.admin_site.admin_view(self.csr_details_view),
+                    name=csr_name))
+
+        return urls
+
+    def revoke(self, request, queryset):
+        for cert in queryset:
+            cert.revoke()
+    revoke.short_description = _('Revoke selected certificates')
+
+    def get_fieldsets(self, request, obj=None):
+        """Collapse the "Revocation" section unless the certificate is revoked."""
+        fieldsets = super(SigningRequestAdmin, self).get_fieldsets(request, obj=obj)
+
+        if obj is None:
+            return self.add_fieldsets
+
+        if obj.revoked is False:
+            fieldsets[2][1]['classes'] = ['collapse', ]
+        else:
+            if 'collapse' in fieldsets[2][1].get('classes', []):
+                fieldsets[2][1]['classes'].remove('collapse')
+        return fieldsets
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj is None:
+            return []
+        return super(SigningRequestAdmin, self).get_readonly_fields(request, obj=obj)
+
+    def status(self, obj):
+        return _('Valid')
+        if obj.revoked:
+            return _('Revoked')
+        if obj.expires < timezone.now():
+            return _('Expired')
+        else:
+            return _('Valid')
+    status.short_description = _('Status')
+
+    def expires_date(self, obj):
+        if obj.expires:
+            return obj.expires.date()
+        else:
+            return None
+    expires_date.short_description = _('Expires')
+    expires_date.admin_order_field = 'expires'
+
+    def save_model(self, request, obj, form, change):
+        data = form.cleaned_data
+        # If this is a new certificate, initialize it.
+        if change is False:  # # pragma: no branch
+            san, cn_in_san = data['subjectAltName']
+            expires = datetime.combine(data['expires'], datetime.min.time())
+            obj.x509 = self.model.objects.create_csr(
+                ca=data['requested_ca'],
+                csr=data['requested_csr'],
+                expires=expires,
+                subject=data['subject'],
+                algorithm=data['algorithm'],
+                subjectAltName=[e.strip() for e in san.split(',') if e.strip()],
+                cn_in_san=cn_in_san,
+                keyUsage=data['keyUsage'],
+                extendedKeyUsage=data['extendedKeyUsage'],
+                password=data['password']
+            )
+        import pdb; pdb.set_trace() # noqa
+        
+        obj.save()
+
+    class Media:
+        css = {
+            'all': (
+                'django_ca/admin/css/csradmin.css',
+                'django_ca/admin/css/monospace.css',
+            ),
+        }
+        js = (
+            'django_ca/admin/js/request.js',
         )

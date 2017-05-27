@@ -96,7 +96,7 @@ class SubjectTextInput(LabeledTextInput):
 
     def render_wrapped(self, name, value, attrs):  # pragma: no cover - <= Django 1.11
         html = super(SubjectTextInput, self).render_wrapped(name, value, attrs)
-        html += '<span class="from-csr">%s <span></span></span>' % _('from CSR:')
+        html += '<span class="from-requested_csr">%s <span></span></span>' % _('from CSR:')
         return html
 
 

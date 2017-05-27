@@ -35,6 +35,8 @@ var prev_cn;
 django.jQuery(document).ready(function() {
     django.jQuery('.field-csr textarea').bind('input', function() {
         var value = django.jQuery(this).val();
+        // Fix surrounding whitespace and newlines
+        value = django.jQuery.trim(value);
 
         if (! (value.startsWith('-----BEGIN CERTIFICATE REQUEST-----\n')
                && value.endsWith('\n-----END CERTIFICATE REQUEST-----'))) {
